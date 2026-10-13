@@ -189,17 +189,25 @@ pub struct ConcurrentBloom<T> {
     _phantom: PhantomData<T>,
 }
 
+fn atomic_vec_from_bits(bits: Box<[u64]>) -> Vec<AtomicU64> {
+    if std::mem::size_of::<AtomicU64>() == std::mem::size_of::<u64>()
+        && std::mem::align_of::<AtomicU64>() == std::mem::align_of::<u64>()
+    {
+        let len = bits.len();
+        let ptr = Box::into_raw(bits) as *mut u64;
+        // SAFETY: the atomic and integer layouts match, and ownership is unique.
+        unsafe { Vec::from_raw_parts(ptr.cast::<AtomicU64>(), len, len) }
+    } else {
+        bits.iter().map(|&x| AtomicU64::new(x)).collect()
+    }
+}
+
 impl<T: BloomHashIndex> From<Bloom<T>> for ConcurrentBloom<T> {
     fn from(bloom: Bloom<T>) -> Self {
         ConcurrentBloom {
             num_bits: bloom.bits.len(),
             keys: bloom.keys,
-            bits: bloom
-                .bits
-                .into_boxed_slice()
-                .iter()
-                .map(|&x| AtomicU64::new(x))
-                .collect(),
+            bits: atomic_vec_from_bits(bloom.bits.into_boxed_slice()),
             _phantom: PhantomData,
         }
     }
@@ -207,16 +215,13 @@ impl<T: BloomHashIndex> From<Bloom<T>> for ConcurrentBloom<T> {
 
 impl<T: BloomHashIndex> ConcurrentBloom<T> {
     fn pos(&self, key: &T, hash_index: u64) -> (usize, u64) {
-        let pos = key
-            .hash_at_index(hash_index)
-            .checked_rem(self.num_bits)
-            .unwrap_or(0);
+        let pos = key.hash_at_index(hash_index) % self.num_bits;
         // Divide by 64 to figure out which of the
         // AtomicU64 bit chunks we need to modify.
-        let index = pos.wrapping_shr(6);
+        let index = pos >> 6;
         // (pos & 63) is equivalent to mod 64 so that we can find
         // the index of the bit within the AtomicU64 to modify.
-        let mask = 1u64.wrapping_shl(u32::try_from(pos & 63).unwrap());
+        let mask = 1u64 << (pos & 63);
         (index as usize, mask)
     }
 
@@ -239,28 +244,35 @@ impl<T: BloomHashIndex> ConcurrentBloom<T> {
         if self.keys.is_empty() || self.bits.is_empty() {
             return false;
         }
-        self.keys.iter().all(|k| {
+        for k in &self.keys {
             let (index, mask) = self.pos(key, *k);
             let bit = self.bits[index].load(Ordering::Relaxed) & mask;
-            bit != 0u64
-        })
+            if bit == 0u64 {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn clear(&self) {
-        self.bits.iter().for_each(|bit| {
+        for bit in &self.bits {
             bit.store(0u64, Ordering::Relaxed);
-        });
+        }
     }
 }
 
 impl<T: BloomHashIndex> From<ConcurrentBloom<T>> for Bloom<T> {
     fn from(atomic_bloom: ConcurrentBloom<T>) -> Self {
+        let mut num_bits_set = 0;
         let bits: Vec<_> = atomic_bloom
             .bits
             .into_iter()
-            .map(AtomicU64::into_inner)
+            .map(|bit| {
+                let bit = AtomicU64::into_inner(bit);
+                num_bits_set += bit.count_ones() as u64;
+                bit
+            })
             .collect();
-        let num_bits_set = bits.iter().map(|x| x.count_ones() as u64).sum();
         let mut bits: BitVec<u64> = bits.into();
         bits.truncate(atomic_bloom.num_bits);
         Bloom {
