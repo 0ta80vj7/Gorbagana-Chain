@@ -123,11 +123,6 @@ impl<T: BloomHashIndex> Bloom<T> {
             1f64.max(((m / n) * 2f64.ln()).round())
         }
     }
-    fn pos(&self, key: &T, k: u64) -> u64 {
-        key.hash_at_index(k)
-            .checked_rem(self.bits.len())
-            .unwrap_or(0)
-    }
     pub fn clear(&mut self) {
         self.bits = BitVec::new_fill(false, self.bits.len());
         self.num_bits_set = 0;
@@ -136,8 +131,9 @@ impl<T: BloomHashIndex> Bloom<T> {
         if self.bits.is_empty() {
             return;
         }
+        let num_bits = self.bits.len();
         for k in &self.keys {
-            let pos = self.pos(key, *k);
+            let pos = key.hash_at_index(*k) % num_bits;
             if !self.bits.get(pos) {
                 self.num_bits_set = self.num_bits_set.saturating_add(1);
                 self.bits.set(pos, true);
@@ -148,8 +144,9 @@ impl<T: BloomHashIndex> Bloom<T> {
         if self.keys.is_empty() || self.bits.is_empty() {
             return false;
         }
+        let num_bits = self.bits.len();
         for k in &self.keys {
-            let pos = self.pos(key, *k);
+            let pos = key.hash_at_index(*k) % num_bits;
             if !self.bits.get(pos) {
                 return false;
             }
@@ -158,9 +155,21 @@ impl<T: BloomHashIndex> Bloom<T> {
     }
 }
 
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// FNV-1a keyed with `hash_index`, the same as `FnvHasher::with_key`.
+/// Whole 8-byte chunks are hashed in an unrolled loop, the tail by `FnvHasher`.
 fn slice_hash(slice: &[u8], hash_index: u64) -> u64 {
-    let mut hasher = FnvHasher::with_key(hash_index);
-    hasher.write(slice);
+    let mut hash = hash_index;
+    let mut chunks = slice.chunks_exact(8);
+    for chunk in &mut chunks {
+        let chunk: &[u8; 8] = chunk.try_into().unwrap();
+        for &byte in chunk {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+        }
+    }
+    let mut hasher = FnvHasher::with_key(hash);
+    hasher.write(chunks.remainder());
     hasher.finish()
 }
 
